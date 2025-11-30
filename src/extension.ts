@@ -2,9 +2,66 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as jsonc from 'jsonc-parser';
+import { downloadMod } from './modDownloader';
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('VSModNavigator is now active!');
+
+    // Register Download Command
+    context.subscriptions.push(vscode.commands.registerCommand('vs-mod-navigator.downloadMod', async (modId?: string) => {
+        if (!modId) {
+            modId = await vscode.window.showInputBox({
+                prompt: 'Enter Mod ID (e.g. rustboundmagic)',
+                placeHolder: 'rustboundmagic'
+            });
+        }
+
+        if (modId) {
+            const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+            if (!workspaceFolder) {
+                vscode.window.showErrorMessage('No workspace folder open.');
+                return;
+            }
+            await downloadMod(modId, workspaceFolder);
+        }
+    }));
+
+    // Register Hover Provider for missing mods
+    context.subscriptions.push(vscode.languages.registerHoverProvider(
+        { scheme: 'file', language: 'json' },
+        {
+            async provideHover(document, position, token) {
+                const text = document.getText();
+                const tree = jsonc.parseTree(text);
+                if (!tree) return undefined;
+
+                const offset = document.offsetAt(position);
+                const node = jsonc.findNodeAtOffset(tree, offset);
+
+                if (!node || node.type !== 'string') return undefined;
+
+                // Check if it's a value of "file" or "path" property, OR just a string that looks like a path
+                // The user might hover over "rustboundmagic:..." anywhere.
+                // But let's be safe and check if it looks like a VS path.
+                const value = node.value;
+                if (typeof value === 'string' && value.includes(':')) {
+                    const parts = value.split(':');
+                    if (parts.length === 2) {
+                        const domain = parts[0];
+                        // Check if domain exists
+                        const exists = await checkDomainExists(domain);
+                        if (!exists) {
+                            const args = encodeURIComponent(JSON.stringify([domain]));
+                            const md = new vscode.MarkdownString(`Mod '${domain}' not found in workspace. \n\n[Download Mod](command:vs-mod-navigator.downloadMod?${args})`);
+                            md.isTrusted = true;
+                            return new vscode.Hover(md);
+                        }
+                    }
+                }
+                return undefined;
+            }
+        }
+    ));
 
     const provider = vscode.languages.registerDefinitionProvider(
         { scheme: 'file', language: 'json' },
@@ -202,6 +259,36 @@ async function resolveVintageStoryPath(pathStr: string): Promise<vscode.Uri | un
     }
 
     return undefined;
+}
+
+async function checkDomainExists(domain: string): Promise<boolean> {
+    if (!vscode.workspace.workspaceFolders) {
+        return false;
+    }
+
+    const isMatchingFolder = (name: string) => name === domain || name.startsWith(domain + '_') || name.startsWith(domain + '-');
+
+    for (const folder of vscode.workspace.workspaceFolders) {
+        if (isMatchingFolder(folder.name)) {
+             // Check if it has assets/domain
+             const assetsPath = path.join(folder.uri.fsPath, 'assets', domain);
+             if (fs.existsSync(assetsPath)) return true;
+        }
+
+        // Check subdirectories
+        try {
+            const children = await vscode.workspace.fs.readDirectory(folder.uri);
+            for (const [name, type] of children) {
+                if (type === vscode.FileType.Directory && isMatchingFolder(name)) {
+                    const assetsPath = path.join(folder.uri.fsPath, name, 'assets', domain);
+                    if (fs.existsSync(assetsPath)) return true;
+                }
+            }
+        } catch (e) {
+            // Ignore errors reading directory
+        }
+    }
+    return false;
 }
 
 function findProperty(node: jsonc.Node, key: string): jsonc.Node | undefined {
